@@ -1,12 +1,13 @@
+import logging
+import time
+import numpy as np
+
 from fastapi import FastAPI, HTTPException, Response, Request
 from pydantic import BaseModel
 from transformers import pipeline
-import logging
-import time
-from typing import List # Import List for type hinting
-
-from prometheus_client import Counter, Histogram, generate_latest, CollectorRegistry, Gauge # Import Gauge
-from sklearn.metrics import precision_recall_fscore_support # Métriques de classification par catégorie
+from typing import List
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from prometheus_client import Counter, Histogram, generate_latest, CollectorRegistry, Gauge
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="News Classifier API",
     description="API for classifying news articles into categories using a Hugging Face model.",
-    version="1.5.0"
+    version="2.0.0"
 )
 
 registry = CollectorRegistry()
@@ -40,32 +41,45 @@ predictions_by_category = Counter(
     registry=registry
 )
 
-# Nouvelle métrique : Gauge pour l'accuracy du modèle
 model_accuracy_score = Gauge(
     'model_accuracy_score',
     'Current accuracy of the News Classifier model',
     registry=registry
 )
 
-# Gauges precision / recall / f1 par catégorie
+# Nouvelles métriques : Gauges pour Precision, Recall, F1-score par catégorie
 model_precision_score = Gauge(
     'model_precision_score',
-    'Precision of the News Classifier model per category',
+    'Precision score of the News Classifier model by category',
     ['category'],
     registry=registry
 )
 
 model_recall_score = Gauge(
     'model_recall_score',
-    'Recall of the News Classifier model per category',
-    ['category'],
+    'Recall score of the News Classifier model by category',
+    ['category'], # Avec un label pour la catégorie
     registry=registry
 )
 
 model_f1_score = Gauge(
     'model_f1_score',
-    'F1 score of the News Classifier model per category',
-    ['category'],
+    'F1 score of the News Classifier model by category',
+    ['category'], # Avec un label pour la catégorie
+    registry=registry
+)
+
+# Nouvel Histogramme pour la longueur des textes d'entrée
+input_text_length_histogram = Histogram(
+    'input_text_length_chars',
+    'Length of input text in characters',
+    registry=registry
+)
+
+# Nouvel Histogramme pour le score de confiance des prédictions
+prediction_confidence_score_histogram = Histogram(
+    'prediction_confidence_score',
+    'Confidence score of model predictions',
     registry=registry
 )
 
@@ -103,6 +117,8 @@ async def predict(article: ArticleInput):
             status_code = "400"
             raise HTTPException(status_code=400, detail="Input text cannot be empty.")
 
+        # Observer la longueur du texte d'entrée
+        input_text_length_histogram.observe(len(article.text))
         results = classifier(article.text)
         if not results:
             logger.error(f"Classifier returned empty results for text: {article.text[:50]}...")
@@ -113,6 +129,8 @@ async def predict(article: ArticleInput):
         confidence_score = results[0]['score']
 
         predictions_by_category.labels(category=predicted_category).inc()
+        # Observer le score de confiance
+        prediction_confidence_score_histogram.observe(confidence_score)
 
         logger.info(f"Classified text: '{article.text[:50]}...' into category: '{predicted_category}' with score: {confidence_score:.4f}")
         return PredictionOutput(category=predicted_category, score=confidence_score)
@@ -138,52 +156,61 @@ async def evaluate_model(items: List[EvaluationItem]):
     Updates the model_accuracy_score metric.
     """
     start_time = time.time()
+    status_code = "200"
 
-    if not items:
-        raise HTTPException(status_code=400, detail="No items provided for evaluation.")
+    try:
+        if not items:
+            status_code = "400"
+            raise HTTPException(status_code=400, detail="No items provided for evaluation.")
 
-    correct_predictions = 0
-    total_predictions = len(items)
+        true_labels = []
+        predicted_labels = []
+        total_predictions = len(items)
 
-    y_true: List[str] = []
-    y_pred: List[str] = []
+        # Récupérer toutes les catégories uniques pour les métriques par catégorie
+        all_categories = sorted(list(set([item.true_label.lower() for item in items] + [val.lower() for val in getattr(classifier, 'model').config.id2label.values()])))
 
-    for item in items:
-        try:
-            prediction = classifier(item.text)[0]['label']
-            true_label = item.true_label.upper() # Normaliser la casse pour la comparaison
-            predicted = prediction.upper()
-            y_true.append(true_label)
-            y_pred.append(predicted)
-            if predicted == true_label:
-                correct_predictions += 1
-        except Exception as e:
-            logger.error(f"Error during evaluation for text: {item.text[:50]}... Error: {e}")
+        for item in items:
+            try:
+                prediction_result = classifier(item.text)
+                predicted_label = prediction_result[0]['label']
+                true_labels.append(item.true_label.lower())
+                predicted_labels.append(predicted_label.lower())
 
-    accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0
+            except Exception as e:
+                logger.error(f"Error during single item evaluation for text: {item.text[:50]}... Error: {e}")
+                total_predictions -= 1
 
-    # Mettre à jour la métrique Prometheus Gauge (accuracy globale)
-    model_accuracy_score.set(accuracy)
+        if not true_labels:
+            raise HTTPException(status_code=500, detail="No successful predictions during evaluation.")
 
-    # Calcul precision / recall / f1 par catégorie via scikit-learn
-    if y_true:
-        labels = sorted(set(y_true) | set(y_pred))
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y_true, y_pred, labels=labels, average=None, zero_division=0
-        )
-        for cat, p, r, f in zip(labels, precision, recall, f1):
-            model_precision_score.labels(category=cat).set(p)
-            model_recall_score.labels(category=cat).set(r)
-            model_f1_score.labels(category=cat).set(f)
+        # Calcul de l'Accuracy globale
+        accuracy = accuracy_score(true_labels, predicted_labels)
+        model_accuracy_score.set(accuracy)
 
-    logger.info(f"Model evaluated. Accuracy: {accuracy:.4f} on {total_predictions} items.")
+        # Calcul de Precision, Recall, F1-score par catégorie
+        p, r, f1, _ = precision_recall_fscore_support(true_labels, predicted_labels, labels=all_categories, average=None, zero_division=0)
 
-    # Incrémenter les métriques d'API pour l'endpoint /evaluate
-    api_requests_total.labels(endpoint="/evaluate", method="POST", status_code="200").inc()
-    api_request_duration_seconds.labels(endpoint="/evaluate", method="POST", status_code="200").observe(time.time() - start_time)
+        for i, category in enumerate(all_categories):
+            model_precision_score.labels(category=category).set(p[i])
+            model_recall_score.labels(category=category).set(r[i])
+            model_f1_score.labels(category=category).set(f1[i])
 
+        logger.info(f"Model evaluated. Accuracy: {accuracy:.4f} on {total_predictions} items. Per-category scores updated.")
+        return {"message": "Model evaluation completed", "accuracy": accuracy, "evaluated_items": total_predictions}
 
-    return {"message": "Model evaluation completed", "accuracy": accuracy, "evaluated_items": total_predictions}
+    except HTTPException as e:
+        status_code = str(e.status_code)
+        raise
+    except Exception as e:
+        logger.error(f"Error during evaluation of model: {e}")
+        status_code = "500"
+        raise HTTPException(status_code=500, detail=f"Model evaluation failed due to an internal error: {e}")
+    finally:
+        end_time = time.time()
+        duration = end_time - start_time
+        api_request_duration_seconds.labels(endpoint="/evaluate", method="POST", status_code=status_code).observe(duration)
+        api_requests_total.labels(endpoint="/evaluate", method="POST", status_code=status_code).inc()
 
 @app.get("/metrics")
 async def metrics(request: Request):
