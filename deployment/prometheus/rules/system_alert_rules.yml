@@ -1,0 +1,30 @@
+# deployment/prometheus/rules/system_alert_rules.yml
+groups:
+  - name: system-alerts
+    rules:
+      - alert: HighCpuUsage
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Utilisation CPU élevée sur {{ $labels.instance }}"
+          description: "L'utilisation du CPU dépasse 90% depuis plus de 5 minutes (valeur actuelle : {{ printf \"%.1f\" $value }}%)."
+
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemTotal_bytes - node_memory_MemFree_bytes) / node_memory_MemTotal_bytes * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Utilisation mémoire élevée sur {{ $labels.instance }}"
+          description: "L'utilisation de la mémoire dépasse 80% depuis plus de 5 minutes (valeur actuelle : {{ printf \"%.1f\" $value }}%)."
+
+      - alert: HighDiskUsage
+        expr: 100 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"} * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Espace disque faible sur {{ $labels.instance }} ({{ $labels.mountpoint }})"
+          description: "L'utilisation du disque dépasse 85% depuis plus de 5 minutes (valeur actuelle : {{ printf \"%.1f\" $value }}%)."

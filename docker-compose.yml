@@ -42,6 +42,27 @@ services:
       - prometheus
     restart: always
 
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+      # C'est sur ce port que Prometheus viendra "scraper" les métriques système.
+    volumes:
+      - /proc:/host/proc:ro
+      # Le répertoire '/proc' contient des informations vitales sur l'état du noyau Linux et des processus en cours (utilisation CPU par process, infos mémoire, etc.).
+      - /sys:/host/sys:ro
+      # Le répertoire '/sys' expose des informations sur les périphériques matériels et les configurations du noyau.
+      - /:/rootfs:ro
+      # C'est essentiel pour que Node Exporter puisse accéder aux informations sur l'utilisation de l'espace disque de l'hôte.
+    command:
+    # Ces commandes indiquent à Node Exporter où trouver les systèmes de fichiers de l'hôte que nous venons de monter via les volumes.
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/run/docker/netns/.+)$$'
+    restart: always
+
 volumes:
   prometheus_data: {}
   grafana_data: {}
